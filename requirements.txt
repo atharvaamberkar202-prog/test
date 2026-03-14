@@ -1,8 +1,11 @@
+streamlit
 yfinance
 pandas
 numpy
+plotly
 scipy
 requests
-plotly
-textblob
 vaderSentiment
+textblob
+arch
+scikit-learn
