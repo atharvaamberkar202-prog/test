@@ -922,49 +922,140 @@ with r2b:
 # ═════════════════════════════════════════════════════════════════════════════
 # INTERPRETATION
 # ═════════════════════════════════════════════════════════════════════════════
-section_hdr("✦", "Quantitative Interpretation")
+section_hdr("✦", "What Does This All Mean?")
 
-mean_chg   = chgs["Mean"]
-bias       = ("bullish 📈" if mean_chg >  0.15
-              else "bearish 📉" if mean_chg < -0.15
-              else "neutral ⚖️")
-vol_regime = ("elevated" if ann_vol > 22
-              else "moderate" if ann_vol > 14
-              else "subdued")
-gf_desc    = ("positive global tailwinds" if gf >  0.5
-              else "negative global headwinds" if gf < -0.5
-              else "mixed global cues")
-ns_desc    = ("bullish" if ns >  0.1 else "bearish" if ns < -0.1 else "neutral")
-sgx_desc   = ("pricing a gap-up" if sgx["premium_pct"] >  0.10
-              else "pricing a gap-down" if sgx["premium_pct"] < -0.10
-              else "broadly flat")
-weekend_note = (
-    f" News sentiment receives a <strong>{news_weight/NEWS_WEIGHT_WEEKDAY:.0f}× "
-    f"weekend multiplier</strong> ({news_weight*100:.1f}% p.a. vs the "
-    f"{NEWS_WEIGHT_WEEKDAY*100:.1f}% weekday baseline) reflecting 2-day "
-    f"news accumulation with no intraday price release. "
-    if IS_WEEKEND else
-    (f" Friday pre-weekend elevated news weighting ({news_weight*100:.1f}% p.a.) "
-     f"reflects heightened gap risk into the weekend. " if IS_FRIDAY else "")
-)
+# ── Compute a simple composite score [-1, +1] from all three signals ─────────
+# Each signal is already in [-1, +1].  Simple equal-weight average.
+gf_signal_unit  = gf / 3.0                          # global indices
+sgx_signal_unit = sgx["signal"]                      # SGX/GIFT futures
+ns_signal_unit  = ns                                 # news sentiment
+composite       = (gf_signal_unit + sgx_signal_unit + ns_signal_unit) / 3.0
 
+# Map composite to a plain-English verdict + colour
+if   composite >  0.25:  verdict = "BULLISH"  ; v_col = GREEN  ; v_icon = "🟢"
+elif composite >  0.05:  verdict = "MILDLY BULLISH" ; v_col = "#70e0b0" ; v_icon = "🟡"
+elif composite < -0.25:  verdict = "BEARISH"  ; v_col = RED    ; v_icon = "🔴"
+elif composite < -0.05:  verdict = "MILDLY BEARISH" ; v_col = "#ff8c9a" ; v_icon = "🟠"
+else:                    verdict = "NEUTRAL"   ; v_col = AMBER  ; v_icon = "⚪"
+
+mean_chg = chgs["Mean"]
+
+# ── Per-signal plain label ───────────────────────────────────────────────────
+def _arrow(v, threshold=0.05):
+    if   v >  threshold: return "🟢 Positive"
+    elif v < -threshold: return "🔴 Negative"
+    else:                return "⚪ Neutral"
+
+gf_label  = _arrow(gf_signal_unit,  0.10)
+sgx_label = _arrow(sgx_signal_unit, 0.05)
+ns_label  = _arrow(ns_signal_unit,  0.05)
+
+# Weekend note (plain English)
+we_note = ""
+if IS_WEEKEND:
+    we_note = (f"📅 It's the weekend, so news headlines carry extra weight "
+               f"({news_weight*100:.0f}% vs the normal {NEWS_WEIGHT_WEEKDAY*100:.0f}%) "
+               f"because markets haven't had a chance to react yet.")
+elif IS_FRIDAY:
+    we_note = (f"📅 It's Friday — news weight is slightly higher than normal "
+               f"({news_weight*100:.0f}%) to account for weekend gap risk.")
+
+# ── Big verdict banner ───────────────────────────────────────────────────────
 st.markdown(f"""
-<div class="interp">
-The model carries a <strong>{bias}</strong> bias for the next NIFTY session,
-with the mean simulated return of <strong>{mean_chg:+.3f}%</strong> driven by
-a three-signal adjusted drift (global indices, SGX futures, news sentiment).
-Annualised volatility is <strong>{ann_vol:.2f}%</strong> —
-a <strong>{vol_regime}</strong> regime — with the P5–P95 band spanning
-<strong>&#8377;{pcts['P5']:,.0f} – &#8377;{pcts['P95']:,.0f}</strong>.
-SGX / GIFT Nifty futures are <strong>{sgx_desc}</strong>
-({sgx["premium_pct"]:+.3f}% premium, contributing {sgx_contrib:+.2f}% p.a.);
-global indices signal <strong>{gf_desc}</strong>
-(factor {gf:+.3f}, contributing {gf_contrib:+.2f}% p.a.);
-and news flow is <strong>{ns_desc}</strong>
-(score {ns:+.3f}, contributing {ns_contrib:+.2f}% p.a. at current session weight).{weekend_note}
-Total drift adjustment above the historical baseline: <strong>{drift_adj:+.2f}% annualised</strong>.
+<div style="background:#0a1628;border:2px solid {v_col};border-radius:12px;
+            padding:22px 28px;margin-bottom:16px;text-align:center;">
+  <div style="font-size:13px;color:#7a9abf;text-transform:uppercase;
+              letter-spacing:2px;margin-bottom:6px;">Overall Direction for Next Session</div>
+  <div style="font-size:42px;font-weight:800;color:{v_col};
+              letter-spacing:1px;">{v_icon} {verdict}</div>
+  <div style="font-size:15px;color:#a0bcd8;margin-top:8px;">
+    Average of all signals: <strong style="color:{v_col};">{composite:+.2f}</strong>
+    &nbsp;·&nbsp;
+    Expected move: <strong style="color:{v_col};">{mean_chg:+.3f}%</strong>
+    &nbsp;·&nbsp;
+    Price range (90%): <strong>&#8377;{pcts['P5']:,.0f} – &#8377;{pcts['P95']:,.0f}</strong>
+  </div>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Three signal cards ───────────────────────────────────────────────────────
+ia, ib, ic = st.columns(3)
+
+with ia:
+    st.markdown(f"""
+    <div style="background:#0a1628;border:1px solid #1a2f4a;border-radius:10px;padding:18px;">
+      <div style="font-size:11px;color:#4a6a8a;text-transform:uppercase;
+                  letter-spacing:1px;margin-bottom:6px;">🌍 Global Markets</div>
+      <div style="font-size:18px;font-weight:700;color:#e0ecff;margin-bottom:4px;">
+        {gf_label}
+      </div>
+      <div style="font-size:13px;color:#7a9abf;line-height:1.6;">
+        The last session across major world indices
+        (S&amp;P 500, DAX, Nikkei, etc.) was
+        <strong>{"mostly up" if gf_signal_unit > 0.05 else "mostly down" if gf_signal_unit < -0.05 else "mixed"}</strong>.
+        This {"adds upward" if gf_signal_unit >= 0 else "adds downward"} momentum
+        to NIFTY's opening.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+with ib:
+    sgx_premium_word = ("above" if sgx["premium_pct"] > 0 else "below")
+    st.markdown(f"""
+    <div style="background:#0a1628;border:1px solid #1a2f4a;border-radius:10px;padding:18px;">
+      <div style="font-size:11px;color:#4a6a8a;text-transform:uppercase;
+                  letter-spacing:1px;margin-bottom:6px;">📊 SGX / GIFT Nifty Futures</div>
+      <div style="font-size:18px;font-weight:700;color:#e0ecff;margin-bottom:4px;">
+        {sgx_label}
+      </div>
+      <div style="font-size:13px;color:#7a9abf;line-height:1.6;">
+        GIFT Nifty futures are trading
+        <strong>{abs(sgx["premium_pct"]):.2f}% {sgx_premium_word}</strong>
+        the last NIFTY spot close (&#8377;{S0:,.0f}).
+        Futures {"above" if sgx["premium_pct"] > 0 else "below"} spot typically
+        signal a {"higher" if sgx["premium_pct"] > 0 else "lower"} open.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+with ic:
+    st.markdown(f"""
+    <div style="background:#0a1628;border:1px solid #1a2f4a;border-radius:10px;padding:18px;">
+      <div style="font-size:11px;color:#4a6a8a;text-transform:uppercase;
+                  letter-spacing:1px;margin-bottom:6px;">📰 News Sentiment</div>
+      <div style="font-size:18px;font-weight:700;color:#e0ecff;margin-bottom:4px;">
+        {ns_label}
+      </div>
+      <div style="font-size:13px;color:#7a9abf;line-height:1.6;">
+        The tone of recent financial headlines is
+        <strong>{"positive" if ns > 0.05 else "negative" if ns < -0.05 else "broadly neutral"}</strong>
+        (score: {ns:+.2f}).
+        {"Weekend weighting means this signal has more influence today." if IS_WEEKEND or IS_FRIDAY else "On a normal weekday this carries the standard weight."}
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+# ── Weekend/Friday note ──────────────────────────────────────────────────────
+if we_note:
+    st.markdown(
+        f'<div style="background:#071e10;border:1px solid #1a4a2a;border-radius:8px;'
+        f'padding:12px 18px;margin-top:12px;font-size:13px;color:#80c8a0;">'
+        f'{we_note}</div>',
+        unsafe_allow_html=True)
+
+# ── Volatility note ──────────────────────────────────────────────────────────
+vol_plain = ("higher than usual" if ann_vol > 22
+             else "around normal levels" if ann_vol > 14
+             else "lower than usual")
+st.markdown(
+    f'<div style="background:#0a1628;border:1px solid #1a2f4a;border-radius:8px;'
+    f'padding:12px 18px;margin-top:10px;font-size:13px;color:#7a9abf;">'
+    f'📉 <strong style="color:#e0ecff;">Expected volatility</strong> is '
+    f'<strong>{vol_plain}</strong> at {ann_vol:.1f}% annualised — meaning '
+    f'the market could realistically close anywhere between '
+    f'<strong style="color:{RED};">&#8377;{pcts["P5"]:,.0f}</strong> and '
+    f'<strong style="color:{GREEN};">&#8377;{pcts["P95"]:,.0f}</strong> '
+    f'in the next session (90% of simulated outcomes).'
+    f'</div>',
+    unsafe_allow_html=True)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
