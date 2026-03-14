@@ -252,17 +252,61 @@ def fetch_prices(lookback_yr: int) -> dict:
     start = (datetime.date.today() -
              datetime.timedelta(days=365 * lookback_yr + 30)).strftime("%Y-%m-%d")
 
-    def _dl(ticker):
+    def _dl(ticker: str) -> pd.Series:
+        """
+        Download a single ticker and return a clean named pd.Series of
+        daily Close prices.  Handles both yfinance ≤0.1.x (flat columns)
+        and ≥0.2.x (MultiIndex columns like ('Close', '^NSEI')).
+        """
         try:
-            df = yf.download(ticker, start=start, end=end,
-                             auto_adjust=True, progress=False)
-            if df.empty:
+            df = yf.download(
+                ticker,
+                start=start, end=end,
+                auto_adjust=True,
+                progress=False,
+                multi_level_index=False,   # request flat columns when possible
+            )
+        except TypeError:
+            # older yfinance that doesn't accept multi_level_index kwarg
+            try:
+                df = yf.download(ticker, start=start, end=end,
+                                 auto_adjust=True, progress=False)
+            except Exception:
                 return pd.Series(dtype=float, name=ticker)
-            s = df["Close"].squeeze()
-            s.name = ticker
-            return s.dropna()
         except Exception:
             return pd.Series(dtype=float, name=ticker)
+
+        if df is None or df.empty:
+            return pd.Series(dtype=float, name=ticker)
+
+        # ── Flatten MultiIndex columns if present ─────────────────────────────
+        if isinstance(df.columns, pd.MultiIndex):
+            # columns look like: [('Close','^NSEI'), ('Open','^NSEI'), ...]
+            df.columns = [c[0] if isinstance(c, tuple) else c
+                          for c in df.columns]
+
+        if "Close" not in df.columns:
+            # Last-resort: take the first numeric column
+            numeric_cols = df.select_dtypes(include="number").columns
+            if len(numeric_cols) == 0:
+                return pd.Series(dtype=float, name=ticker)
+            col = numeric_cols[0]
+        else:
+            col = "Close"
+
+        s = df[col].copy()
+        # squeeze() can still return a DataFrame if there are duplicate cols
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+
+        s = s.squeeze()
+        if not isinstance(s, pd.Series):
+            return pd.Series(dtype=float, name=ticker)
+
+        s = s.dropna()
+        s.name = ticker          # always force the ticker as the series name
+        s.index = pd.to_datetime(s.index)
+        return s
 
     nifty = _dl(NIFTY_TICKER)
     if nifty.empty:
@@ -270,21 +314,28 @@ def fetch_prices(lookback_yr: int) -> dict:
 
     global_raw = {nm: _dl(tk) for nm, tk in GLOBAL_INDICES.items()}
 
-    all_s    = [nifty] + [v for v in global_raw.values() if not v.empty]
-    combined = pd.concat(all_s, axis=1)
+    # ── Align on a shared date index using name-based concatenation ───────────
+    # Key fix: use the series name as the column key, not s.name after concat
+    valid_globals = {nm: s for nm, s in global_raw.items() if not s.empty}
+
+    all_series = {"__NIFTY__": nifty}
+    for nm, s in valid_globals.items():
+        all_series[nm] = s          # key = friendly name, not ticker
+
+    combined = pd.concat(all_series.values(), axis=1, keys=all_series.keys())
     combined.index = pd.to_datetime(combined.index)
     combined.sort_index(inplace=True)
 
-    nifty_a = combined.iloc[:, 0].dropna()
+    nifty_a = combined["__NIFTY__"].dropna()
 
     global_a = {}
-    for nm, s in global_raw.items():
-        if not s.empty and s.name in combined.columns:
-            g = combined[s.name].dropna()
+    for nm in valid_globals:
+        if nm in combined.columns:
+            g = combined[nm].dropna()
             if not g.empty:
                 global_a[nm] = g
 
-    def log_ret(s):
+    def log_ret(s: pd.Series) -> pd.Series:
         return np.log(s / s.shift(1)).dropna()
 
     return {
@@ -352,6 +403,19 @@ def fetch_sgx_nifty(nifty_spot: float) -> dict:
     Tries NSE monthly futures tickers first, then falls back to S&P 500
     E-mini futures (ES=F) rescaled as a proxy directional signal.
     """
+    def _get_close_series(df: pd.DataFrame) -> pd.Series:
+        """Flatten any MultiIndex columns and return the Close series."""
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c
+                          for c in df.columns]
+        col = "Close" if "Close" in df.columns else df.select_dtypes("number").columns[0]
+        s   = df[col]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return s.squeeze().dropna()
+
     candidates = _sgx_ticker_candidates()
     two_days   = (datetime.date.today() -
                   datetime.timedelta(days=6)).strftime("%Y-%m-%d")
@@ -360,12 +424,16 @@ def fetch_sgx_nifty(nifty_spot: float) -> dict:
 
     for ticker in candidates:
         try:
-            df = yf.download(ticker, start=two_days, end=tomorrow,
-                             auto_adjust=True, progress=False,
-                             interval="1d")
-            if df.empty:
-                continue
-            close_s = df["Close"].dropna()
+            try:
+                df = yf.download(ticker, start=two_days, end=tomorrow,
+                                 auto_adjust=True, progress=False,
+                                 interval="1d", multi_level_index=False)
+            except TypeError:
+                df = yf.download(ticker, start=two_days, end=tomorrow,
+                                 auto_adjust=True, progress=False,
+                                 interval="1d")
+
+            close_s = _get_close_series(df)
             if len(close_s) < 1:
                 continue
             fut_price = float(close_s.iloc[-1])
