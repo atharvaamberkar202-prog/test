@@ -145,21 +145,156 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────────────────────
 NIFTY_TICKER  = "^NSEI"
 
-# ── SGX / GIFT Nifty — ticker candidates tried in order ──────────────────────
-# GIFT Nifty (formerly SGX Nifty) trades on NSE IFSC / SGX.
-# yfinance exposes NSE monthly futures; we try current & next two months then
-# fall back to S&P 500 / NASDAQ E-mini futures as globally-traded proxies.
-def _sgx_ticker_candidates() -> list[str]:
-    cands = []
-    today = datetime.date.today()
-    for delta in [0, 1, 2]:
-        y   = today.year + (today.month - 1 + delta) // 12
-        m   = (today.month - 1 + delta) % 12 + 1
-        mon = datetime.date(y, m, 1).strftime("%b").upper()
-        yr2 = str(y)[2:]
-        cands.append(f"NIFTY{yr2}{mon}FUT.NS")    # e.g. NIFTY26MARFUT.NS
-    cands += ["ES=F", "NQ=F"]                      # global futures fallback
+# ── SGX / GIFT Nifty signal ───────────────────────────────────────────────────
+# Strategy (tried in order):
+#   1. GIFT Nifty intraday — fetch ^NSEI at 1-min interval for today's
+#      pre-market / latest tick vs previous close → gives a real live signal
+#   2. NSE near-month futures via correct yfinance format (NIFTYYYMMM.NS)
+#   3. ES=F (S&P 500 E-mini) as a directional proxy ONLY — we use its
+#      *return*, never its raw price, to avoid the ₹5,800 confusion
+
+def _build_nse_futures_tickers() -> list[str]:
+    """Return NSE near-month futures tickers in the format yfinance accepts."""
+    today  = datetime.date.today()
+    cands  = []
+    # yfinance NSE futures format: NIFTYYYMMMFUT.NS  e.g. NIFTY25MARFUT.NS
+    for delta in range(3):
+        year  = today.year + (today.month - 1 + delta) // 12
+        month = (today.month - 1 + delta) % 12 + 1
+        mon3  = datetime.date(year, month, 1).strftime("%b").upper()   # MAR
+        yr2   = str(year)[2:]                                          # 25
+        cands.append(f"NIFTY{yr2}{mon3}FUT.NS")
     return cands
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_sgx_nifty(nifty_spot: float, last_date: str) -> dict:
+    """
+    Derive a GIFT-Nifty-equivalent signal.  Returns:
+        price        – implied NIFTY-equivalent level (always in NIFTY units)
+        premium_pct  – implied % premium/discount vs nifty_spot
+        signal       – normalised [-1, +1]
+        source       – human-readable label
+        available    – True if we got a real/proxy price
+        is_proxy     – True when using global-futures proxy (ES=F / NQ=F)
+    """
+
+    def _flatten_close(df: pd.DataFrame) -> pd.Series:
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        col = "Close" if "Close" in df.columns else (
+            df.select_dtypes("number").columns[0]
+            if len(df.select_dtypes("number").columns) else None)
+        if col is None:
+            return pd.Series(dtype=float)
+        s = df[col]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return s.squeeze().dropna()
+
+    def _dl(ticker, **kwargs):
+        try:
+            df = yf.download(ticker, progress=False,
+                             multi_level_index=False, **kwargs)
+        except TypeError:
+            df = yf.download(ticker, progress=False, **kwargs)
+        return df
+
+    today_str    = datetime.date.today().strftime("%Y-%m-%d")
+    tomorrow_str = (datetime.date.today() +
+                    datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    week_ago_str = (datetime.date.today() -
+                    datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # ── Attempt 1: NIFTY intraday to detect today's live premium vs last close ─
+    # Works during Indian market hours (09:15–15:30 IST).
+    try:
+        df_intra = _dl("^NSEI", period="1d", interval="5m")
+        s_intra  = _flatten_close(df_intra)
+        if len(s_intra) >= 2:
+            live_price  = float(s_intra.iloc[-1])
+            open_price  = float(s_intra.iloc[0])
+            # Confirmed last close is nifty_spot; compare latest tick
+            if abs(live_price - nifty_spot) / nifty_spot < 0.10:  # sanity: within 10%
+                premium_pct = (live_price / nifty_spot - 1.0) * 100
+                signal      = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+                return {
+                    "price"      : round(live_price, 2),
+                    "premium_pct": round(premium_pct, 3),
+                    "signal"     : signal,
+                    "ticker"     : "^NSEI (intraday)",
+                    "source"     : "NIFTY Live / Intraday",
+                    "available"  : True,
+                    "is_proxy"   : False,
+                }
+    except Exception:
+        pass
+
+    # ── Attempt 2: NSE near-month futures ─────────────────────────────────────
+    for ticker in _build_nse_futures_tickers():
+        try:
+            df  = _dl(ticker, start=week_ago_str, end=tomorrow_str)
+            s   = _flatten_close(df)
+            if len(s) < 1:
+                continue
+            fut_price = float(s.iloc[-1])
+            # Sanity: must be within 5% of spot (genuine NIFTY-unit futures)
+            if fut_price <= 0 or abs(fut_price / nifty_spot - 1) > 0.05:
+                continue
+            premium_pct = (fut_price / nifty_spot - 1.0) * 100
+            signal      = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+            return {
+                "price"      : round(fut_price, 2),
+                "premium_pct": round(premium_pct, 3),
+                "signal"     : signal,
+                "ticker"     : ticker,
+                "source"     : f"NSE Futures ({ticker})",
+                "available"  : True,
+                "is_proxy"   : False,
+            }
+        except Exception:
+            continue
+
+    # ── Attempt 3: ES=F / NQ=F as DIRECTIONAL PROXY ───────────────────────────
+    # CRITICAL: we use the proxy's *return* to infer a NIFTY-equivalent move,
+    # then compute an implied NIFTY price.  We NEVER show the raw ES/NQ price.
+    for ticker in ("ES=F", "NQ=F"):
+        try:
+            df = _dl(ticker, start=week_ago_str, end=tomorrow_str)
+            s  = _flatten_close(df)
+            if len(s) < 2:
+                continue
+            proxy_ret   = float(s.iloc[-1] / s.iloc[-2]) - 1.0
+            # Implied NIFTY-equivalent price derived from proxy return
+            implied_nifty = nifty_spot * (1.0 + proxy_ret)
+            premium_pct   = proxy_ret * 100
+            signal        = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+            return {
+                "price"      : round(implied_nifty, 2),   # ← NIFTY units, not ES price
+                "premium_pct": round(premium_pct, 3),
+                "signal"     : signal,
+                "ticker"     : ticker,
+                "source"     : f"Proxy via {ticker} return (NIFTY-equivalent)",
+                "available"  : True,
+                "is_proxy"   : True,
+            }
+        except Exception:
+            continue
+
+    # ── Hard fallback ─────────────────────────────────────────────────────────
+    return {
+        "price"      : nifty_spot,
+        "premium_pct": 0.0,
+        "signal"     : 0.0,
+        "ticker"     : "N/A",
+        "source"     : "Unavailable — signal set to neutral",
+        "available"  : False,
+        "is_proxy"   : False,
+    }
+
+
 
 # ── Weekend-aware news sentiment weights (annualised %) ──────────────────────
 # On weekends 2 days of news accumulate with no intraday price release valve,
@@ -392,92 +527,6 @@ def get_sentiment(api_key: str) -> dict:
             "method": method, "n": len(scores)}
 
 
-@st.cache_data(ttl=900, show_spinner=False)   # 15-min cache — futures move fast
-def fetch_sgx_nifty(nifty_spot: float) -> dict:
-    """
-    Fetch the most recent GIFT / SGX Nifty futures price and compute:
-      - futures price & source ticker
-      - premium / discount vs NIFTY spot (%)
-      - directional signal in [-1, +1]
-
-    Tries NSE monthly futures tickers first, then falls back to S&P 500
-    E-mini futures (ES=F) rescaled as a proxy directional signal.
-    """
-    def _get_close_series(df: pd.DataFrame) -> pd.Series:
-        """Flatten any MultiIndex columns and return the Close series."""
-        if df is None or df.empty:
-            return pd.Series(dtype=float)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] if isinstance(c, tuple) else c
-                          for c in df.columns]
-        col = "Close" if "Close" in df.columns else df.select_dtypes("number").columns[0]
-        s   = df[col]
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
-        return s.squeeze().dropna()
-
-    candidates = _sgx_ticker_candidates()
-    two_days   = (datetime.date.today() -
-                  datetime.timedelta(days=6)).strftime("%Y-%m-%d")
-    tomorrow   = (datetime.date.today() +
-                  datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    for ticker in candidates:
-        try:
-            try:
-                df = yf.download(ticker, start=two_days, end=tomorrow,
-                                 auto_adjust=True, progress=False,
-                                 interval="1d", multi_level_index=False)
-            except TypeError:
-                df = yf.download(ticker, start=two_days, end=tomorrow,
-                                 auto_adjust=True, progress=False,
-                                 interval="1d")
-
-            close_s = _get_close_series(df)
-            if len(close_s) < 1:
-                continue
-            fut_price = float(close_s.iloc[-1])
-            if fut_price <= 0:
-                continue
-
-            is_proxy   = ticker in ("ES=F", "NQ=F")
-            source_lbl = f"GIFT/NSE Futures ({ticker})"
-
-            if is_proxy:
-                # For global futures proxies we use their 1-day return to
-                # infer an equivalent NIFTY premium/discount.
-                if len(close_s) >= 2:
-                    proxy_ret = float(close_s.iloc[-1] / close_s.iloc[-2]) - 1.0
-                else:
-                    proxy_ret = 0.0
-                premium_pct = proxy_ret * 100
-                source_lbl  = f"Global Futures Proxy ({ticker})"
-            else:
-                premium_pct = (fut_price / nifty_spot - 1.0) * 100
-
-            # Signal: cap premium at ±2% → normalise to [-1, +1]
-            signal = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
-
-            return {
-                "price"      : round(fut_price, 2),
-                "premium_pct": round(premium_pct, 3),
-                "signal"     : signal,
-                "ticker"     : ticker,
-                "source"     : source_lbl,
-                "available"  : True,
-            }
-        except Exception:
-            continue
-
-    # Hard fallback — no SGX signal available
-    return {
-        "price"      : nifty_spot,
-        "premium_pct": 0.0,
-        "signal"     : 0.0,
-        "ticker"     : "N/A",
-        "source"     : "Unavailable",
-        "available"  : False,
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -498,7 +547,7 @@ S0 = float(data["nifty"].iloc[-1])
 
 # ── SGX / GIFT Nifty signal ───────────────────────────────────────────────────
 with st.spinner("🌐 Fetching SGX / GIFT Nifty futures …"):
-    sgx = fetch_sgx_nifty(S0)
+    sgx = fetch_sgx_nifty(S0, data["last_date"])
 
 # ── Weekend detection ─────────────────────────────────────────────────────────
 _today      = datetime.date.today()
@@ -826,10 +875,16 @@ st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 # ── Row 2: signal breakdown ───────────────────────────────────────────────────
 c2 = st.columns(5)
 with c2[0]:
-    sgx_col = val_colour(sgx["premium_pct"])
-    sgx_avail = "✓ " + sgx["source"] if sgx["available"] else "⚠ Fallback proxy"
-    kpi("SGX / GIFT Nifty", f"&#8377; {sgx['price']:,.2f}",
-        f"{sgx_avail}", sgx_col)
+    sgx_col   = val_colour(sgx["premium_pct"])
+    is_proxy  = sgx.get("is_proxy", False)
+    if not sgx["available"]:
+        sgx_status = "⚠ Unavailable"
+    elif is_proxy:
+        sgx_status = f"⚠ Proxy ({sgx['ticker']}) — est."
+    else:
+        sgx_status = f"✓ {sgx['source']}"
+    price_label = f"&#8377; {sgx['price']:,.2f}" if sgx["available"] else "N/A"
+    kpi("SGX / GIFT Nifty (implied)", price_label, sgx_status, sgx_col)
 with c2[1]:
     sgx_prem_col = val_colour(sgx["premium_pct"])
     kpi("SGX Premium", f"{sgx['premium_pct']:+.3f}%",
@@ -999,7 +1054,8 @@ with ia:
     </div>""", unsafe_allow_html=True)
 
 with ib:
-    sgx_premium_word = ("above" if sgx["premium_pct"] > 0 else "below")
+    sgx_premium_word = "above" if sgx["premium_pct"] > 0 else "below"
+    proxy_note = " (estimated via global futures return)" if sgx.get("is_proxy") else ""
     st.markdown(f"""
     <div style="background:#0a1628;border:1px solid #1a2f4a;border-radius:10px;padding:18px;">
       <div style="font-size:11px;color:#4a6a8a;text-transform:uppercase;
@@ -1008,11 +1064,10 @@ with ib:
         {sgx_label}
       </div>
       <div style="font-size:13px;color:#7a9abf;line-height:1.6;">
-        GIFT Nifty futures are trading
-        <strong>{abs(sgx["premium_pct"]):.2f}% {sgx_premium_word}</strong>
-        the last NIFTY spot close (&#8377;{S0:,.0f}).
-        Futures {"above" if sgx["premium_pct"] > 0 else "below"} spot typically
-        signal a {"higher" if sgx["premium_pct"] > 0 else "lower"} open.
+        GIFT Nifty is implying a level of <strong>&#8377;{sgx['price']:,.0f}</strong>
+        — that's <strong>{abs(sgx["premium_pct"]):.2f}% {sgx_premium_word}</strong>
+        the last NIFTY close of &#8377;{S0:,.0f}{proxy_note}.
+        This typically signals a {"higher" if sgx["premium_pct"] > 0 else "lower"} open.
       </div>
     </div>""", unsafe_allow_html=True)
 
