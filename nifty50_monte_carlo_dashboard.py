@@ -35,6 +35,14 @@ import numpy  as np
 import pandas as pd
 import requests
 
+# ── scipy (KDE for Chart 4) ───────────────────────────────────────────────────
+try:
+    from scipy.stats import gaussian_kde
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    gaussian_kde    = None          # handled gracefully in step7
+
 warnings.filterwarnings("ignore")
 
 # ── Optional rich sentiment library (VADER preferred, TextBlob fallback) ─────
@@ -590,10 +598,19 @@ def step7_build_dashboard(
     )
 
     # ── Chart 4: KDE / Distribution with percentile markers ──────────────────
-    from scipy.stats import gaussian_kde
     kde_x = np.linspace(S_next.min(), S_next.max(), 500)
-    kde   = gaussian_kde(S_next)
-    kde_y = kde(kde_x)
+    if SCIPY_AVAILABLE and gaussian_kde is not None:
+        _kde_obj = gaussian_kde(S_next)
+        kde_y    = _kde_obj(kde_x)
+        def kde(x):   # wrapper so kde(S0) returns array
+            return _kde_obj(np.atleast_1d(x))
+    else:
+        # Pure-numpy histogram density (no scipy required)
+        _counts, _edges = np.histogram(S_next, bins=200, density=True)
+        _centres        = (_edges[:-1] + _edges[1:]) / 2
+        kde_y           = np.interp(kde_x, _centres, _counts)
+        def kde(x):
+            return np.interp(np.atleast_1d(x), _centres, _counts)
 
     fig4 = go.Figure()
     # Colour the area: red below S0, green above
