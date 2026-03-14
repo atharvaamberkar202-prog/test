@@ -203,7 +203,7 @@ with st.sidebar:
 
 **Model**
 - Geometric Brownian Motion (GBM)
-- `adj_mu = mu + GF×0.3 + NS×0.2`
+- `adj_mu = mu + (gf/3×3% + ns×1%) / 252`
 
 **Sentiment**
 - VADER → TextBlob → Keyword
@@ -340,12 +340,20 @@ rets    = data["nifty_returns"].dropna()
 mu      = float(rets.mean())
 sigma   = float(rets.std())
 ns      = sentiment["score"]
-adj_mu  = mu + gf * 0.3 + ns * 0.2
+# ── Quant-grade signal scaling ────────────────────────────────────────────────
+# gf  is a Z-score (range ≈ ±3) → rescale to unit [-1, +1] first
+# ns  is already [-1, +1]
+# Each signal contributes a bounded annual alpha that is converted to daily:
+#   global signal  → max ±3 % p.a.  (gf_unit × 0.03)
+#   news sentiment → max ±1 % p.a.  (ns      × 0.01)
+gf_unit    = gf / 3.0                              # Z-score → [-1, +1]
+alpha_day  = (gf_unit * 0.03 + ns * 0.01) / 252   # annual alpha → daily
+adj_mu     = mu + alpha_day
 
 ann_vol    = sigma  * math.sqrt(252) * 100
 ann_mu     = mu     * 252 * 100
 ann_adjmu  = adj_mu * 252 * 100
-drift_adj  = (gf * 0.3 + ns * 0.2) * 252 * 100
+drift_adj  = (gf_unit * 0.03 + ns * 0.01) * 100   # annualised % contribution
 
 # ── Monte Carlo ───────────────────────────────────────────────────────────────
 S0     = float(data["nifty"].iloc[-1])
