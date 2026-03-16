@@ -330,7 +330,7 @@ def fetch_gift_nifty(nifty_spot: float, _cache_bust: int) -> dict:
 
     # ── 1. GIFT NIFTY direct ──────────────────────────────────────────────────
     # NSE listed GIFT Nifty continuous futures ticker
-    for gift_ticker in ("GIFTNIFTY.NS", "NIFTYBEES.NS"):
+    for gift_ticker in ("GIFTNIFTY.NS"):
         try:
             df = _yf_download(gift_ticker, period="5d", interval="5m")
             s  = _extract_close(df, gift_ticker)
