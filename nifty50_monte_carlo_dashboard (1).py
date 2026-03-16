@@ -1111,7 +1111,11 @@ st.markdown(
     f'</div>',
     unsafe_allow_html=True)
 
+import streamlit as st
 
+if st.button("Reset App"):
+    st.session_state.clear()
+    st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
