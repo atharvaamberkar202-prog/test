@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings("ignore")
 
@@ -1116,6 +1117,8 @@ import streamlit as st
 if st.button("Reset App"):
     st.session_state.clear()
     st.rerun()
+
+st_autorefresh(interval=30000, key="refresh")  # refresh every 5 minutes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
