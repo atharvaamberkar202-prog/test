@@ -9,3 +9,4 @@ vaderSentiment
 textblob
 arch
 scikit-learn
+streamlit-autorefresh
