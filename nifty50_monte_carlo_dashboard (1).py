@@ -169,6 +169,35 @@ def _build_nse_futures_tickers() -> list[str]:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+
+# ─────────────────────────────────────────────────────────────
+# FETCH LIVE GIFT NIFTY FUTURES
+# ─────────────────────────────────────────────────────────────
+def fetch_gifty_nifty_price():
+    """
+    Fetch real-time GIFT Nifty futures price from Yahoo Finance
+    """
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=NIFTY1!"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+
+        result = data.get("quoteResponse", {}).get("result", [])
+
+        if len(result) == 0:
+            return None
+
+        price = result[0].get("regularMarketPrice", None)
+
+        if price is None:
+            return None
+
+        return float(price)
+
+    except Exception:
+        return None
+
+
 def fetch_sgx_nifty(nifty_spot: float, last_date: str) -> dict:
     """
     Derive a GIFT-Nifty-equivalent signal.  Returns:
@@ -204,6 +233,29 @@ def fetch_sgx_nifty(nifty_spot: float, last_date: str) -> dict:
         return df
 
     today_str    = datetime.date.today().strftime("%Y-%m-%d")
+# ── Attempt 0: Real GIFT Nifty Futures ─────────────────────
+    try:
+
+        gifty_price = fetch_gifty_nifty_price()
+
+        if gifty_price is not None and gifty_price > 0:
+
+            premium_pct = (gifty_price / nifty_spot - 1.0) * 100
+            signal = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+
+            return {
+                "price": round(gifty_price, 2),
+                "premium_pct": round(premium_pct, 3),
+                "signal": signal,
+                "ticker": "NIFTY1!",
+                "source": "GIFT Nifty Futures",
+                "available": True,
+                "is_proxy": False,
+            }
+
+    except Exception:
+        pass
+  
     tomorrow_str = (datetime.date.today() +
                     datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     week_ago_str = (datetime.date.today() -
