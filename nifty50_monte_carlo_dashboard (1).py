@@ -8,6 +8,7 @@
 
   requirements.txt:
       streamlit
+      streamlit-autorefresh
       yfinance
       pandas
       numpy
@@ -22,13 +23,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
-import os, math, warnings, datetime
+import os, math, warnings, datetime, time
 import numpy  as np
 import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
-from streamlit_autorefresh import st_autorefresh
 
 warnings.filterwarnings("ignore")
 
@@ -60,6 +60,13 @@ except ImportError:
     st.error("yfinance not installed. Add `yfinance` to requirements.txt")
     st.stop()
 
+# ── streamlit-autorefresh ─────────────────────────────────────────────────────
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_OK = True
+except ImportError:
+    AUTOREFRESH_OK = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG  — must be the FIRST Streamlit call
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +76,20 @@ st.set_page_config(
     layout     = "wide",
     initial_sidebar_state = "expanded",
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REFRESH — must be near the TOP so it triggers a full fresh rerun
+# Every 60 seconds; cache TTL is set to 55s so data is always fresh.
+# ─────────────────────────────────────────────────────────────────────────────
+REFRESH_INTERVAL_MS = 60_000   # 60 seconds
+CACHE_TTL_SEC       = 55       # slightly less than refresh interval
+
+if AUTOREFRESH_OK:
+    _refresh_count = st_autorefresh(interval=REFRESH_INTERVAL_MS, key="auto_refresh")
+else:
+    st.warning("⚠️  `streamlit-autorefresh` not installed — auto-refresh disabled. "
+               "Install with: pip install streamlit-autorefresh")
+    _refresh_count = 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL STYLE
@@ -106,6 +127,409 @@ st.markdown("""
   .prob-title { font-size: 11px; color: #5a7a9a; text-transform: uppercase;
                 letter-spacing: 1px; margin: 8px 0; }
   .prob-val   { font-size: 38px; font-weight: 700;
+                font-variant-numeric: tabular-nums; }
+  .prob-bar-bg {
+    height: 7px; background: #1e2a3a; border-radius: 4px; margin-top: 10px;
+  }
+
+  .interp {
+    background: #071428; border: 1px solid #1a3a5a;
+    border-left: 4px solid #3a7bd5; border-radius: 6px;
+    padding: 18px 22px; font-size: 13px; line-height: 1.85;
+    color: #a0bcd8;
+  }
+
+  .disclaimer {
+    text-align: center; font-size: 11px; color: #2a4a6a;
+    border-top: 1px solid #0f1e30; padding-top: 16px; margin-top: 28px;
+  }
+
+  [data-testid="metric-container"] {
+    background: #0a1628 !important;
+    border: 1px solid #1a2f4a !important;
+    border-radius: 8px !important;
+    padding: 14px 16px !important;
+  }
+  [data-testid="metric-container"] label {
+    color: #4a6a8a !important; font-size: 11px !important;
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  [data-testid="stMetricValue"] {
+    color: #e0ecff !important; font-size: 20px !important;
+    font-weight: 700 !important;
+  }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS & COLOURS
+# ─────────────────────────────────────────────────────────────────────────────
+NIFTY_TICKER = "^NSEI"
+
+GREEN  = "#00e5b0"
+RED    = "#ff4560"
+AMBER  = "#f0c040"
+BLUE   = "#00c8ff"
+PURPLE = "#7b61ff"
+CARD   = "#0a1628"
+GRID   = "#162033"
+
+NEWS_WEIGHT_WEEKDAY = 0.010
+NEWS_WEIGHT_FRIDAY  = 0.018
+NEWS_WEIGHT_WEEKEND = 0.030
+
+GLOBAL_INDICES = {
+    "S&P 500"            : "^GSPC",
+    "NASDAQ 100"         : "^NDX",
+    "Dow Jones"          : "^DJI",
+    "FTSE 100"           : "^FTSE",
+    "DAX"                : "^GDAXI",
+    "Nikkei 225"         : "^N225",
+    "Hang Seng"          : "^HSI",
+    "Shanghai Composite" : "000001.SS",
+}
+
+MOCK_HEADLINES = [
+    "Asian markets slip as Fed signals higher-for-longer rate stance",
+    "India GDP growth beats estimates; RBI holds rates steady",
+    "Oil prices surge on OPEC production cut announcement",
+    "US inflation data shows sticky core CPI; equities under pressure",
+    "China stimulus hopes boost emerging market sentiment",
+    "Tech stocks rally as NVIDIA earnings exceed forecasts",
+    "Global bond yields rise amid debt ceiling uncertainty",
+    "Foreign institutional investors net buyers in Indian equities",
+    "Rupee strengthens against dollar on positive trade balance data",
+    "IMF upgrades India growth forecast for current fiscal year",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    lookback = st.selectbox("Lookback period",
+                            [3, 5, 7], index=1,
+                            format_func=lambda x: f"{x} years")
+    n_sims = st.selectbox("Monte Carlo paths",
+                          [1_000, 5_000, 10_000, 20_000], index=2,
+                          format_func=lambda x: f"{x:,} paths")
+    news_key = st.text_input(
+        "NewsAPI Key (optional)",
+        value=os.getenv("NEWS_API_KEY", ""),
+        type="password",
+        help="Free key from newsapi.org — leave blank to use mock headlines")
+
+    if st.button("🔄 Force Refresh All Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown(f"""
+**Auto-Refresh:** every {REFRESH_INTERVAL_MS // 1000}s · Refresh #{_refresh_count}
+
+**GIFT Nifty Source Priority**
+1. `GIFT NIFTY` — direct yfinance `NIFTY.NS` / `BANKNIFTY.NS`
+2. NSE near-month futures `NIFTYYYMMM.NS`
+3. S&P 500 E-mini `ES=F` directional proxy
+
+**Drift Formula**
+```
+adj_mu = mu + alpha/252
+alpha  = GF×3% + SGX×w% + NS×nw%
+```
+
+**Weekend Weighting**
+- Mon–Thu: news `nw=1.0%`, SGX `w=1.5%`
+- Friday:  news `nw=1.8%`, SGX `w=2.5%`
+- Weekend: news `nw=3.0%`, SGX `w=4.0%`
+
+**Sentiment**
+- VADER → TextBlob → Keyword
+""")
+    st.caption("⚠️ Educational use only. Not investment advice.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS — yfinance download wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+def _yf_download(ticker: str, **kwargs) -> pd.DataFrame:
+    """Robust yfinance downloader that handles both old and new API."""
+    try:
+        df = yf.download(ticker, progress=False,
+                         multi_level_index=False, **kwargs)
+    except TypeError:
+        try:
+            df = yf.download(ticker, progress=False, **kwargs)
+        except Exception:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    return df if df is not None else pd.DataFrame()
+
+
+def _extract_close(df: pd.DataFrame, ticker: str = "") -> pd.Series:
+    """Extract a clean Close price Series from a yfinance DataFrame."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float, name=ticker)
+    # Flatten MultiIndex columns (yfinance ≥0.2.x)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    if "Close" in df.columns:
+        col = "Close"
+    else:
+        nums = df.select_dtypes("number").columns
+        if len(nums) == 0:
+            return pd.Series(dtype=float, name=ticker)
+        col = nums[0]
+    s = df[col]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.squeeze().dropna()
+    if not isinstance(s, pd.Series):
+        return pd.Series(dtype=float, name=ticker)
+    s.name = ticker
+    s.index = pd.to_datetime(s.index)
+    return s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GIFT / SGX NIFTY FUTURES FETCHER  (NO calculations — real data only)
+# ─────────────────────────────────────────────────────────────────────────────
+def _nse_futures_tickers() -> list:
+    """Return up to 3 NSE near-month futures tickers in yfinance format."""
+    today = datetime.date.today()
+    tickers = []
+    for delta in range(3):
+        yr    = today.year  + (today.month - 1 + delta) // 12
+        mo    = (today.month - 1 + delta) % 12 + 1
+        mon3  = datetime.date(yr, mo, 1).strftime("%b").upper()   # e.g. MAR
+        yr2   = str(yr)[2:]                                        # e.g. 25
+        tickers.append(f"NIFTY{yr2}{mon3}FUT.NS")
+    return tickers
+
+
+@st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
+def fetch_gift_nifty(nifty_spot: float, _cache_bust: int) -> dict:
+    """
+    Fetch GIFT Nifty / SGX Nifty futures price in REAL Nifty-point units.
+
+    Strategy (tried in order):
+      1. GIFT NIFTY direct — yfinance ticker  'GIFTNIFTY.NS'  (NSE listed)
+      2. NIFTY spot intraday tick (5-min) — best pre-open/live proxy
+         when GIFT Nifty data is unavailable
+      3. NSE near-month futures  NIFTY25MARFUT.NS  etc.
+      4. ES=F / NQ=F *return* applied to Nifty spot as a directional proxy
+         (raw price is NEVER shown; only the implied Nifty-equivalent)
+      5. Neutral hard-fallback (signal = 0)
+
+    _cache_bust: pass an integer that changes each refresh cycle to force
+                 Streamlit to bypass the cache and fetch fresh data.
+    """
+    tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    week_ago = (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # ── 1. GIFT NIFTY direct ──────────────────────────────────────────────────
+    # NSE listed GIFT Nifty continuous futures ticker
+    for gift_ticker in ("GIFTNIFTY.NS", "NIFTYBEES.NS"):
+        try:
+            df = _yf_download(gift_ticker, period="5d", interval="5m")
+            s  = _extract_close(df, gift_ticker)
+            if len(s) >= 1:
+                gift_price = float(s.iloc[-1])
+                # GIFT Nifty trades in Nifty-equivalent points; validate range
+                if 0.85 * nifty_spot <= gift_price <= 1.15 * nifty_spot:
+                    premium_pct = (gift_price / nifty_spot - 1.0) * 100
+                    signal      = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+                    ts          = str(s.index[-1])
+                    return {
+                        "price"      : round(gift_price, 2),
+                        "premium_pct": round(premium_pct, 3),
+                        "signal"     : signal,
+                        "ticker"     : gift_ticker,
+                        "source"     : f"GIFT NIFTY ({gift_ticker})",
+                        "timestamp"  : ts,
+                        "available"  : True,
+                        "is_proxy"   : False,
+                    }
+        except Exception:
+            pass
+
+    # ── 2. NIFTY intraday live tick (best real-time during market hours) ──────
+    try:
+        df    = _yf_download("^NSEI", period="1d", interval="1m")
+        s     = _extract_close(df, "^NSEI")
+        if len(s) >= 2:
+            live  = float(s.iloc[-1])
+            # Use latest intraday vs previous session close as the signal
+            if 0.90 * nifty_spot <= live <= 1.10 * nifty_spot:
+                premium_pct = (live / nifty_spot - 1.0) * 100
+                signal      = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+                ts          = str(s.index[-1])
+                return {
+                    "price"      : round(live, 2),
+                    "premium_pct": round(premium_pct, 3),
+                    "signal"     : signal,
+                    "ticker"     : "^NSEI (1-min)",
+                    "source"     : "NIFTY Live Intraday (1-min tick)",
+                    "timestamp"  : ts,
+                    "available"  : True,
+                    "is_proxy"   : False,
+                }
+    except Exception:
+        pass
+
+    # ── 3. NSE near-month futures ─────────────────────────────────────────────
+    for ticker in _nse_futures_tickers():
+        try:
+            df = _yf_download(ticker, start=week_ago, end=tomorrow)
+            s  = _extract_close(df, ticker)
+            if len(s) < 1:
+                continue
+            fut_price = float(s.iloc[-1])
+            # Strict sanity: must be within 5% of spot (genuine NIFTY-unit futures)
+            if fut_price <= 0 or abs(fut_price / nifty_spot - 1) > 0.05:
+                continue
+            premium_pct = (fut_price / nifty_spot - 1.0) * 100
+            signal      = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+            ts          = str(s.index[-1])
+            return {
+                "price"      : round(fut_price, 2),
+                "premium_pct": round(premium_pct, 3),
+                "signal"     : signal,
+                "ticker"     : ticker,
+                "source"     : f"NSE Near-Month Futures ({ticker})",
+                "timestamp"  : ts,
+                "available"  : True,
+                "is_proxy"   : False,
+            }
+        except Exception:
+            continue
+
+    # ── 4. ES=F / NQ=F directional proxy ─────────────────────────────────────
+    # IMPORTANT: we use the proxy's *return* only — the raw ES/NQ price
+    # is NEVER shown.  The implied Nifty-equivalent price is derived from
+    # applying the proxy's daily return to the last NIFTY close.
+    for ticker in ("ES=F", "NQ=F"):
+        try:
+            df = _yf_download(ticker, start=week_ago, end=tomorrow)
+            s  = _extract_close(df, ticker)
+            if len(s) < 2:
+                continue
+            proxy_ret     = float(s.iloc[-1] / s.iloc[-2]) - 1.0
+            implied_nifty = nifty_spot * (1.0 + proxy_ret)
+            premium_pct   = proxy_ret * 100
+            signal        = float(np.clip(premium_pct / 2.0, -1.0, 1.0))
+            ts            = str(s.index[-1])
+            return {
+                "price"      : round(implied_nifty, 2),  # NIFTY units, NOT ES price
+                "premium_pct": round(premium_pct, 3),
+                "signal"     : signal,
+                "ticker"     : ticker,
+                "source"     : f"Directional Proxy via {ticker} return (NIFTY-equivalent)",
+                "timestamp"  : ts,
+                "available"  : True,
+                "is_proxy"   : True,
+            }
+        except Exception:
+            continue
+
+    # ── 5. Hard fallback ──────────────────────────────────────────────────────
+    return {
+        "price"      : nifty_spot,
+        "premium_pct": 0.0,
+        "signal"     : 0.0,
+        "ticker"     : "N/A",
+        "source"     : "Unavailable — signal set to neutral",
+        "timestamp"  : "N/A",
+        "available"  : False,
+        "is_proxy"   : False,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRICE DATA PIPELINE  (short TTL = always fresh on auto-refresh)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
+def fetch_prices(lookback_yr: int, _cache_bust: int) -> dict:
+    """
+    Download NIFTY 50 + 8 global indices.
+    _cache_bust changes each auto-refresh cycle to force a fresh download.
+    """
+    end   = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    start = (datetime.date.today() -
+             datetime.timedelta(days=365 * lookback_yr + 30)).strftime("%Y-%m-%d")
+
+    def _dl(ticker: str) -> pd.Series:
+        df = _yf_download(ticker, start=start, end=end, auto_adjust=True)
+        s  = _extract_close(df, ticker)
+        s.index = pd.to_datetime(s.index)
+        return s
+
+    nifty = _dl(NIFTY_TICKER)
+    if nifty.empty:
+        return {}
+
+    global_raw = {nm: _dl(tk) for nm, tk in GLOBAL_INDICES.items()}
+    valid_globals = {nm: s for nm, s in global_raw.items() if not s.empty}
+
+    all_series = {"__NIFTY__": nifty}
+    all_series.update(valid_globals)
+
+    combined = pd.concat(all_series.values(), axis=1, keys=all_series.keys())
+    combined.index = pd.to_datetime(combined.index)
+    combined.sort_index(inplace=True)
+
+    nifty_a  = combined["__NIFTY__"].dropna()
+    global_a = {nm: combined[nm].dropna() for nm in valid_globals
+                if nm in combined.columns and not combined[nm].dropna().empty}
+
+    def log_ret(s: pd.Series) -> pd.Series:
+        return np.log(s / s.shift(1)).dropna()
+
+    return {
+        "nifty"          : nifty_a,
+        "nifty_returns"  : log_ret(nifty_a),
+        "global_closes"  : global_a,
+        "global_returns" : {k: log_ret(v) for k, v in global_a.items()},
+        "last_date"      : str(nifty_a.index[-1].date()),
+        "fetch_time"     : datetime.datetime.now().strftime("%H:%M:%S"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEWS SENTIMENT  (short TTL)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=CACHE_TTL_SEC, show_spinner=False)
+def get_sentiment(api_key: str, _cache_bust: int) -> dict:
+    headlines = MOCK_HEADLINES[:]
+    if api_key:
+        try:
+            url = (
+                "https://newsapi.org/v2/everything"
+                "?q=stock+market+india+nifty+economy+finance"
+                "&sortBy=publishedAt&language=en&pageSize=20"
+                f"&apiKey={api_key}"
+            )
+            r    = requests.get(url, timeout=8)
+            r.raise_for_status()
+            arts = r.json().get("articles", [])
+            hl   = [a["title"] for a in arts if a.get("title")]
+            if hl:
+                headlines = hl
+        except Exception:
+            pass
+
+    scores = []
+    method = "Keyword"
+    if VADER_OK:
+        sia    = SentimentIntensityAnalyzer()
+        scores = [sia.polarity_scores(h)["compound"] for h in headlines]
+        method = "VADER"
+    elif TEXTBLOB_OK:
+        scores = [TextBlob(h).sentiment.polarity for h in headlines]
+        method = "TextBlob"
+    else:
+        POS = {"bull",  .prob-val   { font-size: 38px; font-weight: 700;
                 font-variant-numeric: tabular-nums; }
   .prob-bar-bg {
     height: 7px; background: #1e2a3a; border-radius: 4px; margin-top: 10px;
