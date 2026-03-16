@@ -384,7 +384,7 @@ alpha  = GF×3% + SGX×w% + NS×nw%
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices(lookback_yr: int) -> dict:
-    end   = datetime.date.today().strftime("%Y-%m-%d")
+    end = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     start = (datetime.date.today() -
              datetime.timedelta(days=365 * lookback_yr + 30)).strftime("%Y-%m-%d")
 
