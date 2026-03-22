@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 # -------------------------------
 st.set_page_config(layout="wide", page_title="India VIX Volatility Dashboard")
 
-NEWS_API_KEY = "YOUR_NEWSAPI_KEY"  # <-- Replace this
+NEWS_API_KEY = "1852d6efa58d42c0b7b9b8e7aabbd0e0"  # <-- Replace this
 
 # -------------------------------
 # STYLING (Bloomberg-like)
