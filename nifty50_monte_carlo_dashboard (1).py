@@ -286,11 +286,16 @@ def build_garch_forecast(
     )
 
     # ── Forecast ──
-    # For exog in forecast we use the last observed row repeated
+    # arch requires a 3-D array of shape (n_steps, horizon, n_regressors)
+    # when there are multiple exogenous regressors.
+    # We use the last observed values held constant across the forecast horizon.
     if use_nifty_exog and exog is not None:
-        last_exog = exog.iloc[[-1]].values
-        # Repeat for horizon
-        fcast_exog = np.tile(last_exog, (forecast_horizon, 1))
+        n_regressors = exog.shape[1]
+        last_row = exog.iloc[-1].values          # shape: (n_regressors,)
+        # Build (1, forecast_horizon, n_regressors) — one prediction step,
+        # repeated across the horizon
+        fcast_exog = np.tile(last_row, (1, forecast_horizon, 1))
+        # shape is now (1, forecast_horizon, n_regressors) ✓
         forecasts = res.forecast(horizon=forecast_horizon, x=fcast_exog, reindex=False)
     else:
         forecasts = res.forecast(horizon=forecast_horizon, reindex=False)
