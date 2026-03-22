@@ -11,3 +11,4 @@ arch
 scikit-learn
 streamlit-autorefresh
 statsmodels
+seaborn
