@@ -19,7 +19,7 @@ st.title("📊 India VIX Prop Model (EGARCH + Multi-Factor + Sentiment)")
 # PARAMETERS
 # -----------------------------------
 ROLLING_WINDOW = 120  # days
-NEWS_API_KEY = "YOUR_API_KEY"
+NEWS_API_KEY = "1852d6efa58d42c0b7b9b8e7aabbd0e0"
 
 # -----------------------------------
 # BUTTON
