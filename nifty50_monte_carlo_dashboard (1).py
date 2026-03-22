@@ -1,5 +1,5 @@
 # ============================================
-# INDIA VIX PROP MODEL (PRODUCTION SAFE)
+# INDIA VIX PROP MODEL (FULLY HARDENED)
 # ============================================
 
 import streamlit as st
@@ -14,16 +14,14 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 st.set_page_config(layout="wide")
 st.title("📊 India VIX Prop Model (EGARCH + Multi-Factor + Sentiment)")
 
-# -----------------------------------
-# USER INPUT
-# -----------------------------------
 NEWS_API_KEY = st.text_input("Enter News API Key", type="password")
-
 ROLLING_WINDOW = 120
 
+
 # -----------------------------------
-# SAFE DATA FETCH
+# CACHE + FETCH WITH RETRY
 # -----------------------------------
+@st.cache_data(ttl=3600)
 def fetch_data(ticker):
     for _ in range(3):
         df = yf.download(ticker, period="1y", progress=False)
@@ -31,34 +29,58 @@ def fetch_data(ticker):
             return df
     return pd.DataFrame()
 
+
+# -----------------------------------
+# FLATTEN MULTIINDEX
+# -----------------------------------
+def flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+# -----------------------------------
+# SAFE CLOSE EXTRACTION (FIXED)
+# -----------------------------------
 def safe_close(df, name):
     if df is None or df.empty:
         st.warning(f"{name} data missing")
         return None
 
+    df = flatten_columns(df)
+
     if "Close" in df.columns:
-        return df["Close"]
+        col = df["Close"]
     elif "Adj Close" in df.columns:
-        return df["Adj Close"]
+        col = df["Adj Close"]
     else:
         st.warning(f"{name} has no Close column")
         return None
 
+    # FORCE SERIES (CRITICAL FIX)
+    if isinstance(col, pd.DataFrame):
+        col = col.squeeze()
+
+    if not isinstance(col, pd.Series):
+        st.warning(f"{name} not usable")
+        return None
+
+    return col
+
+
 # -----------------------------------
-# MAIN BUTTON
+# MAIN EXECUTION
 # -----------------------------------
 if st.button("🚀 Run Prop Model"):
 
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching data..."):
 
-        # Fetch all data
         vix_india = fetch_data("^INDIAVIX")
         nifty = fetch_data("^NSEI")
         us_vix = fetch_data("^VIX")
-        dxy = fetch_data("DX=F")       # more stable proxy
+        dxy = fetch_data("DX=F")      # stable proxy
         bonds = fetch_data("^TNX")
 
-        # Extract close safely
         series_list = []
 
         def add_series(df, name):
@@ -73,7 +95,7 @@ if st.button("🚀 Run Prop Model"):
         add_series(bonds, "BOND")
 
         if len(series_list) < 3:
-            st.error("Not enough data to run model")
+            st.error("Not enough valid data")
             st.stop()
 
         # ALIGN DATA
@@ -89,21 +111,21 @@ if st.button("🚀 Run Prop Model"):
         # -----------------------------------
         df["vix_ret"] = np.log(df["INDIA_VIX"] / df["INDIA_VIX"].shift(1))
         df["nifty_ret"] = np.log(df["NIFTY"] / df["NIFTY"].shift(1))
-        
-        if "US_VIX" in df:
-            df["usvix_ret"] = np.log(df["US_VIX"] / df["US_VIX"].shift(1))
-        else:
-            df["usvix_ret"] = 0
 
-        if "DXY" in df:
-            df["dxy_ret"] = np.log(df["DXY"] / df["DXY"].shift(1))
-        else:
-            df["dxy_ret"] = 0
+        df["usvix_ret"] = (
+            np.log(df["US_VIX"] / df["US_VIX"].shift(1))
+            if "US_VIX" in df else 0
+        )
 
-        if "BOND" in df:
-            df["bond_ret"] = np.log(df["BOND"] / df["BOND"].shift(1))
-        else:
-            df["bond_ret"] = 0
+        df["dxy_ret"] = (
+            np.log(df["DXY"] / df["DXY"].shift(1))
+            if "DXY" in df else 0
+        )
+
+        df["bond_ret"] = (
+            np.log(df["BOND"] / df["BOND"].shift(1))
+            if "BOND" in df else 0
+        )
 
         df = df.dropna()
 
@@ -122,11 +144,9 @@ if st.button("🚀 Run Prop Model"):
                 data = r.json()
 
                 headlines = [a["title"] for a in data.get("articles", [])]
-
                 scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
-                avg = np.mean(scores) if scores else 0
 
-                return headlines, avg
+                return headlines, (np.mean(scores) if scores else 0)
 
             except:
                 return [], 0
@@ -140,7 +160,7 @@ if st.button("🚀 Run Prop Model"):
         rolling_vol = []
 
         for i in range(ROLLING_WINDOW, len(returns)):
-            train = returns.iloc[i-ROLLING_WINDOW:i]
+            train = returns.iloc[i - ROLLING_WINDOW:i]
 
             try:
                 model = arch_model(train, vol="EGARCH", p=1, o=1, q=1)
@@ -157,18 +177,17 @@ if st.button("🚀 Run Prop Model"):
         df = df.dropna()
 
         if df.empty:
-            st.error("Model failed to generate output")
+            st.error("Model failed")
             st.stop()
 
         # -----------------------------------
-        # LATEST VALUES
+        # FINAL PREDICTION
         # -----------------------------------
         latest = df.iloc[-1]
 
         base_vol = latest["EGARCH_VOL"]
         adj = base_vol
 
-        # Factor adjustments
         adj += -2.5 * latest["nifty_ret"]
         adj += 1.8 * latest["usvix_ret"]
         adj += 1.2 * latest["dxy_ret"]
@@ -188,7 +207,7 @@ if st.button("🚀 Run Prop Model"):
         c3.metric("Predicted VIX", round(predicted_vix, 2))
 
         # -----------------------------------
-        # PLOT
+        # CHART
         # -----------------------------------
         fig = go.Figure()
 
@@ -214,9 +233,9 @@ if st.button("🚀 Run Prop Model"):
         st.plotly_chart(fig, use_container_width=True)
 
         # -----------------------------------
-        # FACTORS
+        # FACTOR BREAKDOWN
         # -----------------------------------
-        st.subheader("🧠 Factor Breakdown")
+        st.subheader("🧠 Factor Contributions")
 
         st.write("NIFTY:", round(-2.5 * latest["nifty_ret"], 4))
         st.write("US VIX:", round(1.8 * latest["usvix_ret"], 4))
@@ -235,4 +254,3 @@ if st.button("🚀 Run Prop Model"):
                 st.write(f"{h} → {round(score,3)}")
 
             st.write("Avg Sentiment:", round(avg_sentiment, 3))
-            
