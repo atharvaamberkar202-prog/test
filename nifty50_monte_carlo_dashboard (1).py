@@ -12,11 +12,10 @@ import plotly.graph_objects as go
 # CONFIG
 # -------------------------------
 st.set_page_config(layout="wide", page_title="India VIX Volatility Terminal")
-
 NEWS_API_KEY = "YOUR_NEWSAPI_KEY"
 
 # -------------------------------
-# STYLE (Bloomberg-like)
+# STYLE
 # -------------------------------
 st.markdown("""
 <style>
@@ -56,7 +55,7 @@ def fetch_news():
     try:
         url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=10&apiKey={NEWS_API_KEY}"
         res = requests.get(url).json()
-        return [a['title'] for a in res['articles']]
+        return [a['title'] for a in res.get('articles', [])]
     except:
         return []
 
@@ -73,13 +72,24 @@ def run_egarch(df):
         returns = df['VIX_RET'] * 100
         exog = df[['NIFTY_RET']] * 100
 
-        model = arch_model(returns, vol='EGARCH', p=1, q=1, x=exog)
+        model = arch_model(
+            returns,
+            mean='ARX',
+            lags=1,
+            x=exog,
+            vol='EGARCH',
+            p=1,
+            q=1
+        )
+
         res = model.fit(disp="off")
 
-        fc = res.forecast(horizon=1, x=exog.iloc[-1:].values)
-        var = fc.variance.values[-1][0]
+        fc = res.forecast(
+            horizon=1,
+            x=exog.iloc[-1:].values
+        )
 
-        return np.sqrt(var)
+        return np.sqrt(fc.variance.values[-1][0])
 
     except Exception as e:
         st.warning(f"EGARCH Error: {e}")
@@ -93,15 +103,30 @@ def run_garch(df):
         returns = df['VIX_RET'] * 100
         exog = df[['NIFTY_RET']] * 100
 
-        model = arch_model(returns, vol='GARCH', p=1, q=1, x=exog)
+        model = arch_model(
+            returns,
+            mean='ARX',
+            lags=1,
+            x=exog,
+            vol='GARCH',
+            p=1,
+            q=1
+        )
+
         res = model.fit(disp="off")
 
-        fc = res.forecast(horizon=5, x=exog.iloc[-1:].values)
-        var = fc.variance.values[-1]
+        # Proper exogenous shape (5 steps)
+        future_exog = np.tile(exog.iloc[-1].values, (5, 1))
 
+        fc = res.forecast(
+            horizon=5,
+            x=future_exog
+        )
+
+        var = fc.variance.values[-1]
         vol = np.sqrt(var)
 
-        # Smooth curve
+        # Smooth curve (term structure realism)
         decay = np.exp(-0.15 * np.arange(5))
         vol = vol * (1 + 0.1 * decay)
 
@@ -130,10 +155,15 @@ def plot_term_structure(raw, adj):
     fig = go.Figure()
     x = [1,2,3,4,5]
 
-    fig.add_trace(go.Scatter(x=x, y=raw, mode='lines+markers', name="Raw"))
-    fig.add_trace(go.Scatter(x=x, y=adj, mode='lines+markers', name="Adjusted", line=dict(dash='dash')))
+    fig.add_trace(go.Scatter(x=x, y=raw, mode='lines+markers', name="Raw Vol"))
+    fig.add_trace(go.Scatter(x=x, y=adj, mode='lines+markers', name="Sentiment Adjusted", line=dict(dash='dash')))
 
-    fig.update_layout(template="plotly_dark", title="Volatility Term Structure")
+    fig.update_layout(
+        template="plotly_dark",
+        title="Volatility Term Structure",
+        xaxis_title="Days Ahead",
+        yaxis_title="Volatility"
+    )
     return fig
 
 # -------------------------------
@@ -162,13 +192,13 @@ if st.button("🚀 Run Analysis"):
 
             if egarch_1d is not None and garch_5d is not None:
 
-                # Hybrid curve
+                # Hybrid curve (front-end spike)
                 garch_5d[0] = egarch_1d
 
                 adjusted = garch_5d * (1 + sentiment)
 
                 # Table
-                st.subheader("📈 Forecast")
+                st.subheader("📈 Volatility Forecast")
                 forecast_df = pd.DataFrame({
                     "Day": [f"T+{i}" for i in range(1,6)],
                     "Volatility": garch_5d,
@@ -193,4 +223,4 @@ if st.button("🚀 Run Analysis"):
                 st.markdown(f"- {h}")
 
 else:
-    st.info("Click 'Run Analysis'")
+    st.info("Click 'Run Analysis' to start")
