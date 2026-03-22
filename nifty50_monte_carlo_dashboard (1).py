@@ -1,226 +1,152 @@
+# ============================================
+# INDIA VIX VOLATILITY FORECAST DASHBOARD
+# ============================================
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
-from datetime import timedelta
 from arch import arch_model
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import plotly.graph_objects as go
+from datetime import datetime
 
-# -------------------------------
+# --------------------------------------------
 # CONFIG
-# -------------------------------
-st.set_page_config(layout="wide", page_title="India VIX Volatility Terminal")
-NEWS_API_KEY = "YOUR_NEWSAPI_KEY"
+# --------------------------------------------
+st.set_page_config(page_title="India VIX Vol Dashboard", layout="wide")
 
-# -------------------------------
-# STYLE
-# -------------------------------
-st.markdown("""
-<style>
-.stApp { background-color: #0b0f1a; color: #e1e5ed; }
-h1, h2, h3 { color: #f5c542; }
-</style>
-""", unsafe_allow_html=True)
+st.title("📊 India VIX Volatility Forecast Dashboard")
+st.caption("GARCH-based IV forecasting for Calendar & Diagonal Spread Optimization")
 
-# -------------------------------
-# DATA FETCH
-# -------------------------------
-@st.cache_data(ttl=300)
+# --------------------------------------------
+# FETCH DATA
+# --------------------------------------------
+@st.cache_data(ttl=3600)
 def fetch_data():
-    try:
-        vix = yf.download("^INDIAVIX", period="6mo", interval="1d")
-        nifty = yf.download("^NSEI", period="6mo", interval="1d")
+    vix = yf.download("^INDIAVIX", period="1y", interval="1d")
+    nifty = yf.download("^NSEI", period="1y", interval="1d")
 
-        vix = vix[['Close']].rename(columns={'Close': 'VIX'})
-        nifty = nifty[['Close']].rename(columns={'Close': 'NIFTY'})
+    df = pd.DataFrame()
+    df["VIX"] = vix["Close"]
+    df["NIFTY"] = nifty["Close"]
 
-        df = vix.join(nifty, how='inner')
+    df = df.dropna()
+    df["returns"] = np.log(df["VIX"] / df["VIX"].shift(1)) * 100
 
-        df['VIX_RET'] = np.log(df['VIX'] / df['VIX'].shift(1))
-        df['NIFTY_RET'] = np.log(df['NIFTY'] / df['NIFTY'].shift(1))
+    return df.dropna()
 
-        df.dropna(inplace=True)
-        return df
+# --------------------------------------------
+# GARCH MODEL
+# --------------------------------------------
+def run_garch(df, model_type="GARCH"):
 
-    except Exception as e:
-        st.error(f"Data Error: {e}")
-        return None
+    returns = df["returns"]
 
-# -------------------------------
-# NEWS + SENTIMENT
-# -------------------------------
-def fetch_news():
-    try:
-        url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=10&apiKey={NEWS_API_KEY}"
-        res = requests.get(url).json()
-        return [a['title'] for a in res.get('articles', [])]
-    except:
-        return []
+    if model_type == "EGARCH":
+        model = arch_model(returns, vol='EGARCH', p=1, q=1)
+    else:
+        model = arch_model(returns, vol='GARCH', p=1, q=1)
 
-def sentiment_score(headlines):
-    analyzer = SentimentIntensityAnalyzer()
-    scores = [analyzer.polarity_scores(h)['compound'] for h in headlines]
-    return np.mean(scores) if scores else 0
+    res = model.fit(disp="off")
 
-# -------------------------------
-# EGARCH (1-day)
-# -------------------------------
-def run_egarch(df):
-    try:
-        returns = df['VIX_RET'] * 100
-        exog = df[['NIFTY_RET']] * 100
+    forecast = res.forecast(horizon=5)
 
-        model = arch_model(
-            returns,
-            mean='ARX',
-            lags=1,
-            x=exog,
-            vol='EGARCH',
-            p=1,
-            q=1
-        )
+    # Convert variance → volatility
+    vol_forecast = np.sqrt(forecast.variance.values[-1]) * np.sqrt(252)
 
-        res = model.fit(disp="off")
+    return res, vol_forecast
 
-        fc = res.forecast(
-            horizon=1,
-            x=exog.iloc[-1:].values
-        )
+# --------------------------------------------
+# SIGNAL GENERATION
+# --------------------------------------------
+def generate_signal(current_vix, forecast_vol):
 
-        return np.sqrt(fc.variance.values[-1][0])
+    avg_forecast = np.mean(forecast_vol)
 
-    except Exception as e:
-        st.warning(f"EGARCH Error: {e}")
-        return None
+    if current_vix < 13 and avg_forecast > current_vix:
+        return "🟢 IV Expansion Expected → Favor Long Calendar / Diagonal Spreads"
+    
+    elif current_vix > 18 and avg_forecast < current_vix:
+        return "🔴 IV Crush Risk → Avoid Long Vega / Consider Short Vega Structures"
+    
+    else:
+        return "🟡 Neutral → Focus on Theta Decay Strategies"
 
-# -------------------------------
-# GARCH (5-day term structure)
-# -------------------------------
-def run_garch(df):
-    try:
-        returns = df['VIX_RET'] * 100
-        exog = df[['NIFTY_RET']] * 100
-
-        model = arch_model(
-            returns,
-            mean='ARX',
-            lags=1,
-            x=exog,
-            vol='GARCH',
-            p=1,
-            q=1
-        )
-
-        res = model.fit(disp="off")
-
-        # Proper exogenous shape (5 steps)
-        future_exog = np.tile(exog.iloc[-1].values, (5, 1))
-
-        fc = res.forecast(
-            horizon=5,
-            x=future_exog
-        )
-
-        var = fc.variance.values[-1]
-        vol = np.sqrt(var)
-
-        # Smooth curve (term structure realism)
-        decay = np.exp(-0.15 * np.arange(5))
-        vol = vol * (1 + 0.1 * decay)
-
-        return vol
-
-    except Exception as e:
-        st.error(f"GARCH Error: {e}")
-        return None
-
-# -------------------------------
-# PLOTS
-# -------------------------------
+# --------------------------------------------
+# PLOT FUNCTIONS
+# --------------------------------------------
 def plot_vix(df):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df['VIX'], name="India VIX"))
-    fig.update_layout(template="plotly_dark", title="India VIX")
+    fig.add_trace(go.Scatter(x=df.index, y=df["VIX"], name="India VIX"))
+    fig.update_layout(title="India VIX Historical", template="plotly_dark")
     return fig
 
-def plot_nifty(df):
+def plot_forecast(vol_forecast):
+    days = np.arange(1, len(vol_forecast)+1)
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df['NIFTY'], name="NIFTY"))
-    fig.update_layout(template="plotly_dark", title="NIFTY")
+    fig.add_trace(go.Scatter(x=days, y=vol_forecast, mode='lines+markers', name="Forecast Vol"))
+    fig.update_layout(title="Volatility Forecast (Next 5 Days)", template="plotly_dark")
     return fig
 
-def plot_term_structure(raw, adj):
-    fig = go.Figure()
-    x = [1,2,3,4,5]
+# --------------------------------------------
+# MAIN BUTTON
+# --------------------------------------------
+if st.button("🔄 Refresh & Run Model"):
 
-    fig.add_trace(go.Scatter(x=x, y=raw, mode='lines+markers', name="Raw Vol"))
-    fig.add_trace(go.Scatter(x=x, y=adj, mode='lines+markers', name="Sentiment Adjusted", line=dict(dash='dash')))
-
-    fig.update_layout(
-        template="plotly_dark",
-        title="Volatility Term Structure",
-        xaxis_title="Days Ahead",
-        yaxis_title="Volatility"
-    )
-    return fig
-
-# -------------------------------
-# UI
-# -------------------------------
-st.title("📊 India VIX Volatility Terminal")
-
-if st.button("🚀 Run Analysis"):
-
-    with st.spinner("Running full pipeline..."):
+    with st.spinner("Fetching data and running model..."):
 
         df = fetch_data()
 
-        if df is not None:
+        model_type = st.selectbox("Model Type", ["GARCH", "EGARCH"])
 
-            # Sentiment
-            headlines = fetch_news()
-            sentiment = sentiment_score(headlines)
+        res, vol_forecast = run_garch(df, model_type)
 
-            st.subheader("🧠 Sentiment")
-            st.metric("Score", round(sentiment, 3))
+        current_vix = df["VIX"].iloc[-1]
 
-            # Models
-            egarch_1d = run_egarch(df)
-            garch_5d = run_garch(df)
+        signal = generate_signal(current_vix, vol_forecast)
 
-            if egarch_1d is not None and garch_5d is not None:
+    # ----------------------------------------
+    # DISPLAY METRICS
+    # ----------------------------------------
+    col1, col2, col3 = st.columns(3)
 
-                # Hybrid curve (front-end spike)
-                garch_5d[0] = egarch_1d
+    col1.metric("Current VIX", round(current_vix, 2))
+    col2.metric("Avg Forecast Vol", round(np.mean(vol_forecast), 2))
+    col3.metric("Model Used", model_type)
 
-                adjusted = garch_5d * (1 + sentiment)
+    # ----------------------------------------
+    # SIGNAL
+    # ----------------------------------------
+    st.subheader("📌 Trading Signal")
+    st.success(signal)
 
-                # Table
-                st.subheader("📈 Volatility Forecast")
-                forecast_df = pd.DataFrame({
-                    "Day": [f"T+{i}" for i in range(1,6)],
-                    "Volatility": garch_5d,
-                    "Sentiment Adjusted": adjusted
-                })
-                st.dataframe(forecast_df)
+    # ----------------------------------------
+    # PLOTS
+    # ----------------------------------------
+    st.plotly_chart(plot_vix(df), use_container_width=True)
+    st.plotly_chart(plot_forecast(vol_forecast), use_container_width=True)
 
-                # Charts
-                col1, col2 = st.columns(2)
+    # ----------------------------------------
+    # TERM STRUCTURE TABLE
+    # ----------------------------------------
+    st.subheader("📈 Forecast Term Structure")
 
-                with col1:
-                    st.plotly_chart(plot_vix(df), use_container_width=True)
+    term_df = pd.DataFrame({
+        "Day": [f"T+{i}" for i in range(1,6)],
+        "Forecast Vol": vol_forecast
+    })
 
-                with col2:
-                    st.plotly_chart(plot_nifty(df), use_container_width=True)
+    st.dataframe(term_df)
 
-                st.plotly_chart(plot_term_structure(garch_5d, adjusted), use_container_width=True)
+    # ----------------------------------------
+    # MODEL SUMMARY
+    # ----------------------------------------
+    with st.expander("📊 Model Summary"):
+        st.text(res.summary())
 
-            # News
-            st.subheader("📰 Headlines Used in Sentiment")
-            for h in headlines:
-                st.markdown(f"- {h}")
-
-else:
-    st.info("Click 'Run Analysis' to start")
+# --------------------------------------------
+# FOOTER
+# --------------------------------------------
+st.markdown("---")
+st.caption("For educational purposes only. Not financial advice.")
