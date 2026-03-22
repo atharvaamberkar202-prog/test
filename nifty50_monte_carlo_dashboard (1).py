@@ -1,6 +1,5 @@
 # ============================================
-# INDIA VIX PROP MODEL DASHBOARD
-# EGARCH + MULTI FACTOR + ROLLING WINDOW
+# INDIA VIX PROP MODEL (PRODUCTION SAFE)
 # ============================================
 
 import streamlit as st
@@ -16,45 +15,97 @@ st.set_page_config(layout="wide")
 st.title("📊 India VIX Prop Model (EGARCH + Multi-Factor + Sentiment)")
 
 # -----------------------------------
-# PARAMETERS
+# USER INPUT
 # -----------------------------------
-ROLLING_WINDOW = 120  # days
-NEWS_API_KEY = "1852d6efa58d42c0b7b9b8e7aabbd0e0"
+NEWS_API_KEY = st.text_input("Enter News API Key", type="password")
+
+ROLLING_WINDOW = 120
 
 # -----------------------------------
-# BUTTON
+# SAFE DATA FETCH
 # -----------------------------------
-if st.button("🚀 Run Prop Model Pipeline"):
+def fetch_data(ticker):
+    for _ in range(3):
+        df = yf.download(ticker, period="1y", progress=False)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
 
-    with st.spinner("Fetching global market data..."):
+def safe_close(df, name):
+    if df is None or df.empty:
+        st.warning(f"{name} data missing")
+        return None
 
-        # -----------------------------------
-        # FETCH DATA
-        # -----------------------------------
-        vix_india = yf.download("^INDIAVIX", period="1y")
-        nifty = yf.download("^NSEI", period="1y")
-        us_vix = yf.download("^VIX", period="1y")
-        dxy = yf.download("DX-Y.NYB", period="1y")   # Dollar Index
-        bonds = yf.download("^TNX", period="1y")     # US 10Y Yield
+    if "Close" in df.columns:
+        return df["Close"]
+    elif "Adj Close" in df.columns:
+        return df["Adj Close"]
+    else:
+        st.warning(f"{name} has no Close column")
+        return None
 
-        df = pd.DataFrame({
-            "INDIA_VIX": vix_india["Close"],
-            "NIFTY": nifty["Close"],
-            "US_VIX": us_vix["Close"],
-            "DXY": dxy["Close"],
-            "BOND": bonds["Close"]
-        }).dropna()
+# -----------------------------------
+# MAIN BUTTON
+# -----------------------------------
+if st.button("🚀 Run Prop Model"):
+
+    with st.spinner("Fetching market data..."):
+
+        # Fetch all data
+        vix_india = fetch_data("^INDIAVIX")
+        nifty = fetch_data("^NSEI")
+        us_vix = fetch_data("^VIX")
+        dxy = fetch_data("DX=F")       # more stable proxy
+        bonds = fetch_data("^TNX")
+
+        # Extract close safely
+        series_list = []
+
+        def add_series(df, name):
+            s = safe_close(df, name)
+            if s is not None:
+                series_list.append(s.rename(name))
+
+        add_series(vix_india, "INDIA_VIX")
+        add_series(nifty, "NIFTY")
+        add_series(us_vix, "US_VIX")
+        add_series(dxy, "DXY")
+        add_series(bonds, "BOND")
+
+        if len(series_list) < 3:
+            st.error("Not enough data to run model")
+            st.stop()
+
+        # ALIGN DATA
+        df = pd.concat(series_list, axis=1)
+        df = df.dropna()
+
+        if len(df) < ROLLING_WINDOW + 10:
+            st.error("Not enough aligned data")
+            st.stop()
 
         # -----------------------------------
         # RETURNS
         # -----------------------------------
         df["vix_ret"] = np.log(df["INDIA_VIX"] / df["INDIA_VIX"].shift(1))
         df["nifty_ret"] = np.log(df["NIFTY"] / df["NIFTY"].shift(1))
-        df["usvix_ret"] = np.log(df["US_VIX"] / df["US_VIX"].shift(1))
-        df["dxy_ret"] = np.log(df["DXY"] / df["DXY"].shift(1))
-        df["bond_ret"] = np.log(df["BOND"] / df["BOND"].shift(1))
+        
+        if "US_VIX" in df:
+            df["usvix_ret"] = np.log(df["US_VIX"] / df["US_VIX"].shift(1))
+        else:
+            df["usvix_ret"] = 0
 
-        df.dropna(inplace=True)
+        if "DXY" in df:
+            df["dxy_ret"] = np.log(df["DXY"] / df["DXY"].shift(1))
+        else:
+            df["dxy_ret"] = 0
+
+        if "BOND" in df:
+            df["bond_ret"] = np.log(df["BOND"] / df["BOND"].shift(1))
+        else:
+            df["bond_ret"] = 0
+
+        df = df.dropna()
 
         # -----------------------------------
         # SENTIMENT
@@ -62,43 +113,52 @@ if st.button("🚀 Run Prop Model Pipeline"):
         analyzer = SentimentIntensityAnalyzer()
 
         def fetch_news():
-            url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=10&apiKey={NEWS_API_KEY}"
-            r = requests.get(url)
-            data = r.json()
-            return [a["title"] for a in data["articles"]]
+            if not NEWS_API_KEY:
+                return [], 0
 
-        headlines = fetch_news()
+            try:
+                url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=10&apiKey={NEWS_API_KEY}"
+                r = requests.get(url)
+                data = r.json()
 
-        sentiment_scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
-        avg_sentiment = np.mean(sentiment_scores)
+                headlines = [a["title"] for a in data.get("articles", [])]
+
+                scores = [analyzer.polarity_scores(h)["compound"] for h in headlines]
+                avg = np.mean(scores) if scores else 0
+
+                return headlines, avg
+
+            except:
+                return [], 0
+
+        headlines, avg_sentiment = fetch_news()
 
         # -----------------------------------
-        # ROLLING EGARCH MODEL
+        # EGARCH ROLLING
         # -----------------------------------
         returns = df["vix_ret"] * 100
-
-        rolling_forecasts = []
+        rolling_vol = []
 
         for i in range(ROLLING_WINDOW, len(returns)):
-            train = returns[i-ROLLING_WINDOW:i]
+            train = returns.iloc[i-ROLLING_WINDOW:i]
 
-            model = arch_model(
-                train,
-                vol="EGARCH",
-                p=1,
-                q=1,
-                o=1,  # asymmetry term
-                dist="normal"
-            )
+            try:
+                model = arch_model(train, vol="EGARCH", p=1, o=1, q=1)
+                res = model.fit(disp="off")
+                forecast = res.forecast(horizon=1)
+                vol = np.sqrt(forecast.variance.values[-1][0])
+            except:
+                vol = np.nan
 
-            res = model.fit(disp="off")
-            forecast = res.forecast(horizon=1)
-
-            vol = np.sqrt(forecast.variance.values[-1][0])
-            rolling_forecasts.append(vol)
+            rolling_vol.append(vol)
 
         df = df.iloc[ROLLING_WINDOW:]
-        df["EGARCH_VOL"] = rolling_forecasts
+        df["EGARCH_VOL"] = rolling_vol
+        df = df.dropna()
+
+        if df.empty:
+            st.error("Model failed to generate output")
+            st.stop()
 
         # -----------------------------------
         # LATEST VALUES
@@ -106,38 +166,26 @@ if st.button("🚀 Run Prop Model Pipeline"):
         latest = df.iloc[-1]
 
         base_vol = latest["EGARCH_VOL"]
-
-        # -----------------------------------
-        # MULTI-FACTOR ADJUSTMENT
-        # -----------------------------------
         adj = base_vol
 
-        # NIFTY (inverse)
+        # Factor adjustments
         adj += -2.5 * latest["nifty_ret"]
-
-        # US VIX (global fear spillover)
         adj += 1.8 * latest["usvix_ret"]
-
-        # Dollar strength (risk-off proxy)
         adj += 1.2 * latest["dxy_ret"]
-
-        # Bond yields (macro stress)
         adj += 1.0 * latest["bond_ret"]
-
-        # Sentiment (forward signal)
         adj += -1.5 * avg_sentiment
 
         predicted_vix = latest["INDIA_VIX"] * (1 + adj / 100)
 
         # -----------------------------------
-        # OUTPUT
+        # DISPLAY
         # -----------------------------------
-        st.subheader("📌 Model Output")
+        st.subheader("📌 Forecast")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Current India VIX", round(latest["INDIA_VIX"], 2))
-        col2.metric("EGARCH Vol", round(base_vol, 2))
-        col3.metric("Predicted VIX", round(predicted_vix, 2))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Current VIX", round(latest["INDIA_VIX"], 2))
+        c2.metric("EGARCH Vol", round(base_vol, 2))
+        c3.metric("Predicted VIX", round(predicted_vix, 2))
 
         # -----------------------------------
         # PLOT
@@ -160,29 +208,31 @@ if st.button("🚀 Run Prop Model Pipeline"):
             x=[df.index[-1]],
             y=[predicted_vix],
             mode="markers",
-            name="Prediction",
-            marker=dict(size=12)
+            name="Prediction"
         ))
 
         st.plotly_chart(fig, use_container_width=True)
 
         # -----------------------------------
-        # FACTOR BREAKDOWN
+        # FACTORS
         # -----------------------------------
-        st.subheader("🧠 Factor Contributions")
+        st.subheader("🧠 Factor Breakdown")
 
-        st.write(f"NIFTY Effect: {-2.5 * latest['nifty_ret']:.4f}")
-        st.write(f"US VIX Effect: {1.8 * latest['usvix_ret']:.4f}")
-        st.write(f"DXY Effect: {1.2 * latest['dxy_ret']:.4f}")
-        st.write(f"Bond Yield Effect: {1.0 * latest['bond_ret']:.4f}")
-        st.write(f"Sentiment Effect: {-1.5 * avg_sentiment:.4f}")
+        st.write("NIFTY:", round(-2.5 * latest["nifty_ret"], 4))
+        st.write("US VIX:", round(1.8 * latest["usvix_ret"], 4))
+        st.write("DXY:", round(1.2 * latest["dxy_ret"], 4))
+        st.write("BONDS:", round(1.0 * latest["bond_ret"], 4))
+        st.write("Sentiment:", round(-1.5 * avg_sentiment, 4))
 
         # -----------------------------------
-        # NEWS DISPLAY
+        # NEWS
         # -----------------------------------
-        st.subheader("📰 News Driving Sentiment")
+        if headlines:
+            st.subheader("📰 News Sentiment")
 
-        for h, s in zip(headlines, sentiment_scores):
-            st.write(f"{h} → {round(s,3)}")
+            for h in headlines:
+                score = analyzer.polarity_scores(h)["compound"]
+                st.write(f"{h} → {round(score,3)}")
 
-        st.write("### Avg Sentiment:", round(avg_sentiment, 3))
+            st.write("Avg Sentiment:", round(avg_sentiment, 3))
+            
